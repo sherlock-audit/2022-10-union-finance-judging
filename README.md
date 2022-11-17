@@ -592,7 +592,7 @@ Looks like #99 and #74 are dupes, this one is actually a bit more systematic, wi
 Source: https://github.com/sherlock-audit/2022-10-union-finance-judging/issues/133 
 
 ## Found by 
-seyni, Lambda, CodingNameKiki, hyh
+hyh, CodingNameKiki, Lambda, seyni
 
 ## Summary
 
@@ -790,302 +790,12 @@ Reset `lastRepay` for the borrower to 0 when the debt is written off completely
     }
 ```
 
-# Issue H-5: Stakers can have their funds locked for an extended period not related to the performance of their borrowers 
-
-Source: https://github.com/sherlock-audit/2022-10-union-finance-judging/issues/114 
-
-## Found by 
-hyh
-
-## Summary
-
-Some stakers will have their funds lent locked for an extended period of time as partial prepayments to vouch logic (i.e. what vouch to prepay if a borrower provided the funds) depends on vouch order in the borrower's `vouchers` array, while cancelVouch() breaks up the FIFO vouch order it initially was build on. 
-
-## Vulnerability Detail
-
-While voucher array is initially ordered to favor the older lenders, i.e. in FIFO order, this initial order gets broken up over time as cancelVouch() places the very last lender (i.e. one who entered the latest) to the position of the removed one. This is a standard take on array element removal, which violates the redemption business logic in this case.
-
-As a result stakers whose borrowers pay interest in full and do partial redemptions will have their funds locked with the lower priority in the prepayment queue just because some older vouch gets removed and a big vouch from the very end was moved before them.
-
-Say Mike the lender was `2nd` lender for Alice the borrower, who borrowed more funds from various stakers over time, say `5` in total, and have Bob the big lender placed `5th` on her vouchers array as he entered the last.
-
-Now Jade, Alice's `1st` lender, decided to remove the trust as she got payed back in full and the funds are needed elsewhere. `cancelVouch(Jade, Alice)` was called and Alice vouch array length is reduced to be `4`.
-
-Bob gets placed `1st`, Mike is still `2nd`. Now suppose Mike lent Alice 1 year ago and it was `1k DAI`, while Bob lender yesterday and it was `10k DAI`. Now Alice prepayments will go towards Bob instead of Mike, who has his funds frozen until (and if) Bob's part be payed in full.
-
-## Impact
-
-Net impact is temporal funds freeze if Alice remains to be in good health, and permanent fund freeze if Alice stops paying before Mike's turn of the redemptions. I.e. the prepayment order can determine if Mike loan end up being paid or not. Bob has his situation improved on Mike's behalf, who has worsened perspectives of the overall repayment.
-
-This funds freeze is conditional on cancelVouch() calls, but as it needs to be run with ordinary parameters (i.e. remove **any** old vouch) and it is a typical operation (it will be run from time to time by stakers as their `vouchees` array has limited size), while core UNION logic of lender to borrower correspondence is broken here, so setting the severity to be **high**.
-
-## Code Snippet
-
-cancelVouch() switches the vouch being removed with the last one: 
-
-https://github.com/sherlock-audit/2022-10-union-finance/blob/main/union-v2-contracts/contracts/user/UserManager.sol#L577-L591
-
-```solidity
-    function cancelVouch(address staker, address borrower) public onlyMember(msg.sender) whenNotPaused {
-        if (staker != msg.sender && borrower != msg.sender) revert AuthFailed();
-
-        Index memory voucherIndex = voucherIndexes[borrower][staker];
-        if (!voucherIndex.isSet) revert VoucherNotFound();
-
-        // Check that the locked amount for this vouch is 0
-        Vouch memory vouch = vouchers[borrower][voucherIndex.idx];
-        if (vouch.locked > 0) revert LockedStakeNonZero();
-
-        // Remove borrower from vouchers array by moving the last item into the position
-        // of the index being removed and then poping the last item off the array
-        vouchers[borrower][voucherIndex.idx] = vouchers[borrower][vouchers[borrower].length - 1];
-        vouchers[borrower].pop();
-        delete voucherIndexes[borrower][staker];
-```
-
-This logic is the classic take on array removal, but `vouchers[borrower]` array order is material, being used in updateLocked() assuming that array index is a good proxy for loan age, and adhering to the first in, first out logic:
-
-https://github.com/sherlock-audit/2022-10-union-finance/blob/main/union-v2-contracts/contracts/user/UserManager.sol#L800-L841
-
-```solidity
-    function updateLocked(
-        address borrower,
-        uint96 amount,
-        bool lock
-    ) external onlyMarket {
-        uint96 remaining = amount;
-
-        for (uint256 i = 0; i < vouchers[borrower].length; i++) {
-            Vouch storage vouch = vouchers[borrower][i];
-            uint96 innerAmount;
-
-            if (lock) {
-                // Look up the staker and determine how much unlock stake they
-                // have available for the borrower to borrow. If there is 0
-                // then continue to the next voucher in the array
-                uint96 stakerLocked = stakers[vouch.staker].locked;
-                uint96 stakerStakedAmount = stakers[vouch.staker].stakedAmount;
-                uint96 availableStake = stakerStakedAmount - stakerLocked;
-                uint96 lockAmount = _min(availableStake, vouch.trust - vouch.locked);
-                if (lockAmount == 0) continue;
-
-                // Calculate the amount to add to the lock then
-                // add the extra amount to lock to the stakers locked amount
-                // and also update the vouches locked amount and lastUpdated block
-                innerAmount = _min(remaining, lockAmount);
-                stakers[vouch.staker].locked = stakerLocked + innerAmount;
-                vouch.locked += innerAmount;
-                vouch.lastUpdated = uint64(block.number);
-            } else {
-                // Look up how much this vouch has locked. If it is 0 then
-                // continue to the next voucher. Then calculate the amount to
-                // unlock which is the min of the vouches lock and what is
-                // remaining to unlock
-                uint96 locked = vouch.locked;
-                if (locked == 0) continue;
-                innerAmount = _min(locked, remaining);
-
-                // Update the stored locked values and last updated block
-                stakers[vouch.staker].locked -= innerAmount;
-                vouch.locked -= innerAmount;
-                vouch.lastUpdated = uint64(block.number);
-            }
-```
-
-updateLocked() is called when a borrower repays current debt interest in full:
-
-https://github.com/sherlock-audit/2022-10-union-finance/blob/main/union-v2-contracts/contracts/market/UToken.sol#L573-L619
-
-```solidity
-    function _repayBorrowFresh(
-        address payer,
-        address borrower,
-        uint256 amount
-    ) internal {
-        if (!accrueInterest()) revert AccrueInterestFailed();
-
-        uint256 interest = calculatingInterest(borrower);
-        uint256 borrowedAmount = borrowBalanceStoredInternal(borrower);
-        uint256 repayAmount = amount > borrowedAmount ? borrowedAmount : amount;
-        if (repayAmount == 0) revert AmountZero();
-
-        uint256 toReserveAmount;
-        uint256 toRedeemableAmount;
-
-        if (repayAmount >= interest) {
-        	...
-
-            // Call update locked on the userManager to lock this borrowers stakers. This function
-            // will revert if the account does not have enough vouchers to cover the repay amount. ie
-            // the borrower is trying to repay more than is locked (owed)
-            IUserManager(userManager).updateLocked(borrower, uint96(repayAmount - interest), false);
-```
-
-Which vouch to be updated by updateLocked(), i.e. where to allocate this new repayment if a borrower has many locked vouches, is material as it determines who gets the money back:
-
-https://github.com/sherlock-audit/2022-10-union-finance/blob/main/union-v2-contracts/contracts/user/UserManager.sol#L432-L466
-
-```solidity
-    /**
-     *  @dev Get frozen coin age
-     *  @param  staker Address of staker
-     *  @param  pastBlocks Number of blocks past to calculate coin age from
-     *          coin age = min(block.number - lastUpdated, pastBlocks) * amount
-     */
-    function getFrozenInfo(address staker, uint256 pastBlocks)
-        public
-        view
-        returns (uint256 memberTotalFrozen, uint256 memberFrozenCoinAge)
-    {
-        uint256 overdueBlocks = uToken.overdueBlocks();
-        uint256 voucheesLength = vouchees[staker].length;
-        // Loop through all of the stakers vouchees sum their total
-        // locked balance and sum their total memberFrozenCoinAge
-        for (uint256 i = 0; i < voucheesLength; i++) {
-            // Get the vouchee record and look up the borrowers voucher record
-            // to get the locked amount and lastUpdate block number
-            Vouchee memory vouchee = vouchees[staker][i];
-            Vouch memory vouch = vouchers[vouchee.borrower][vouchee.voucherIndex];
-
-            uint256 lastUpdated = vouch.lastUpdated;
-            uint256 diff = block.number - lastUpdated;
-
-            if (overdueBlocks < diff) {
-                uint96 locked = vouch.locked;
-                memberTotalFrozen += locked;
-                if (pastBlocks >= diff) {
-                    memberFrozenCoinAge += (locked * diff);
-                } else {
-                    memberFrozenCoinAge += (locked * pastBlocks);
-                }
-            }
-        }
-    }
-```
-
-This can mean who gets the money faster or who gets the money at all, depending on the future behavior of the borrower.
-
-## Tool used
-
-Manual Review
-
-## Recommendation
-
-A simplest solution is to do it in a hard way and cycle through the whole array, for example:
-
-https://github.com/sherlock-audit/2022-10-union-finance/blob/main/union-v2-contracts/contracts/user/UserManager.sol#L577-L591
-
-```solidity
-    function cancelVouch(address staker, address borrower) public onlyMember(msg.sender) whenNotPaused {
-        if (staker != msg.sender && borrower != msg.sender) revert AuthFailed();
-
-        Index memory voucherIndex = voucherIndexes[borrower][staker];
-        if (!voucherIndex.isSet) revert VoucherNotFound();
-
-        // Check that the locked amount for this vouch is 0
-        Vouch memory vouch = vouchers[borrower][voucherIndex.idx];
-        if (vouch.locked > 0) revert LockedStakeNonZero();
-
-        // Remove borrower from vouchers array by moving the last item into the position
-        // of the index being removed and then poping the last item off the array
-+	... // create new empty array
-+       for (uint256 i = 0; i < vouchers[borrower].length; i++) {
-+           Vouch storage vouch = vouchers[borrower][i];
-+           ... // if `i <> voucherIndex.idx` and vouch has positive trust put it to the new array
-+	for (uint256 i = 0; i < vouchers[borrower].length; i++) {
-+           Vouch storage vouch = vouchers[borrower][i];
-+	    ... // if `i <> voucherIndex.idx` and vouch has zero trust put it to the new array, keeping the old order among them this way
-+	... // replace old `vouches` with new array
--       vouchers[borrower][voucherIndex.idx] = vouchers[borrower][vouchers[borrower].length - 1];
--       vouchers[borrower].pop();
-
-        delete voucherIndexes[borrower][staker];
-```
-
-It can be feasible as `vouchers` length will not be big in the most cases, cancelVouch() isn't that frequent, and loan order is material for business logic to bear additional gas costs.
-
-Also, this reorganisation of non-zero vouches first, zeros later eliminates the potential issue with stakers leaving vouchers with zero amounts just to keep the place in the redemption queue, which also doesn't adhere to FIFO logic.
-
-## Discussion
-
-**kingjacob**
-
-This is as designed and a function of fifo. 
-
-**dmitriia**
-
-The issue is that `cancelVouch` as it is **breaks** FIFO.
-
-As a result, the lenders can be compensated randomly, not according to FIFO.
-
-**kingjacob**
-
-If cancel vouch changes the locked status of stakers of an outstanding borrow without a borrow or repay happening that would be very bad.
-
-But if im understanding the report as borrower locks 1,2,3. Repays enough to unlock 1. 1 cancels. The order is now 3,2. That doesnt significantly change the risk for 2. The risk is still that the borrower you vouched doesnt repay. Theres maybe a marginal risk, But practically its hard to imagine this scenario occurring separate from a straight default or long repayment cycle. 
-
-That said strict FIFO would be preferred for ease of explanation but looping through changes the cost from 1 to n, with each n costing ~5000 gas per N. So its a tradeoff between this edgecase vs more people being able to afford to cancel bad or stale vouches. 
-
-**dmitriia**
-
-Yes, when the oldest vouch 1 is cancelled, the newest one 3 becomes the oldest, while the previous one, 2, keeps its place.
-
-The implications of this isn't just a slight disturbing of the FIFO order, the resulting order can become fully random. This can be a material consideration for lenders and honest borrowers.
-
-Say Bob lends to Amelie through the system, while she is a big borrower with lots of connections, i.e. she is a vouchee for many vouchers, and use this trust a lot.
-
-Now Bob wants to have his money back and asks Amelie, who isn't insolvent and is able and willing to return the debt to Bob. But she can't as the system with repay the debts in nearly random order originated from the sequence of vouches cancellations and new vouches introductions.
-
-As she can't return all debt to all the borrowers or any substantial part of them at this point, it is simply too much liquidity at once, this queue can't be cleared. Bob can't be repaid due to mere technical issue.
-
-This means that the term of a loan cannot be deemed fixed even if both parties agree on it and do honour this agreement.
-
-But rates do differ drastically depending on the term of a loan. This is the `yield curve` and it is steep most of the times. Current interest rate Union employs can be good for say 3 months loan, but insufficient for 3 years one.
-
-This rate can't be just set higher as it is the matter of credit spread, the difference between this rate and risk-free rate for the *term* of a loan. Risk free rates for different terms are quite different, per risk free yield curve. 
-
-For example, if the rate is set to be high it will mean sufficient spread for longer terms, but overly big for shorter terms and honest borrowers will be reluctant to get loans, and vice versa.
-
-That means keeping FIFO intact is crucial and very well justifies gas costs. Those can be kept lower via, for example, additional array `voucherOrder[borrower]` with historical order of the vouchers and accessing `vouchers` across the code not as `vouchers[borrower][i], i = 0, 1, ...`, but as `vouchers[borrower][voucherOrder[borrower][i]], i = 0, 1, ...`.
-
-The code becomes:
-
-```solidity
-    function cancelVouch(address staker, address borrower) public onlyMember(msg.sender) whenNotPaused {
-        if (staker != msg.sender && borrower != msg.sender) revert AuthFailed();
-
-        Index memory voucherIndex = voucherIndexes[borrower][staker];
-        if (!voucherIndex.isSet) revert VoucherNotFound();
-
-        // Check that the locked amount for this vouch is 0
-        Vouch memory vouch = vouchers[borrower][voucherIndex.idx];
-        if (vouch.locked > 0) revert LockedStakeNonZero();
-
-+       bool memory reached;
-+       for (uint16 i = 0; i < voucherOrder[borrower].length - 1; i++) {
-+           if (!reached) {
-+               if (voucherOrder[borrower][i] == voucherIndex.idx) reached = true;
-+           }
-+           if (reached) voucherOrder[borrower][i] = voucherOrder[borrower][i + 1]
-+       }
-+       voucherOrder[borrower].pop();    
-
-        // Remove borrower from vouchers array by moving the last item into the position
-        // of the index being removed and then poping the last item off the array
-        vouchers[borrower][voucherIndex.idx] = vouchers[borrower][vouchers[borrower].length - 1];
-        vouchers[borrower].pop();
-```
-
-`voucherOrder.push(vouchers[borrower].length)` needs to be done before pushing to `vouchers[borrower]` in updateTrust().
-
-
-
-# Issue H-6: Staker rewards can be gathered with maximal multiplier no matter how borrowers are overdue 
+# Issue H-5: Staker rewards can be gathered with maximal multiplier no matter how borrowers are overdue 
 
 Source: https://github.com/sherlock-audit/2022-10-union-finance-judging/issues/74 
 
 ## Found by 
-cccz, hyh
+hyh, cccz
 
 ## Summary
 
@@ -1246,7 +956,7 @@ Dupe of #99
 
 
 
-# Issue H-7: UNION rewards issuance can be maximized without providing credit 
+# Issue H-6: UNION rewards issuance can be maximized without providing credit 
 
 Source: https://github.com/sherlock-audit/2022-10-union-finance-judging/issues/49 
 
@@ -1643,7 +1353,7 @@ https://github.com/sherlock-audit/2022-10-union-finance/blob/main/union-v2-contr
 Source: https://github.com/sherlock-audit/2022-10-union-finance-judging/issues/157 
 
 ## Found by 
-obront, hyh, yixxas, Ch\_301, TurnipBoy, peanuts, Lambda, Picodes
+Ch\_301, hyh, yixxas, TurnipBoy, Picodes, obront, peanuts, Lambda
 
 ## Summary
 
@@ -1876,7 +1586,7 @@ probably a medium because no one is losing funds, just some people might get mor
 Source: https://github.com/sherlock-audit/2022-10-union-finance-judging/issues/126 
 
 ## Found by 
-Jeiwan
+yixxas, Jeiwan
 
 ## Summary
 Removed adapter can still hold funds, removed token can still be deposited to a market.
@@ -1934,7 +1644,301 @@ Manual Review
 ## Recommendation
 In the `removeAdapter` function, check market's supply by calling `moneyMarket.getSupply(token)` before removing an adapter. In the `removeToken` function, iterate over all supported adapters and check if they're still holding the token by calling `moneyMarket.getSupply(token)`.
 
-# Issue M-4: updateTrust() vouchers also need check maxVouchers 
+# Issue M-4: Stakers can have their funds locked for an extended period not related to the performance of their borrowers 
+
+Source: https://github.com/sherlock-audit/2022-10-union-finance-judging/issues/114 
+
+## Found by 
+hyh
+
+## Summary
+
+Some stakers will have their funds lent locked for an extended period of time as partial prepayments to vouch logic (i.e. what vouch to prepay if a borrower provided the funds) depends on vouch order in the borrower's `vouchers` array, while cancelVouch() breaks up the FIFO vouch order it initially was build on. 
+
+## Vulnerability Detail
+
+While voucher array is initially ordered to favor the older lenders, i.e. in FIFO order, this initial order gets broken up over time as cancelVouch() places the very last lender (i.e. one who entered the latest) to the position of the removed one. This is a standard take on array element removal, which violates the redemption business logic in this case.
+
+As a result stakers whose borrowers pay interest in full and do partial redemptions will have their funds locked with the lower priority in the prepayment queue just because some older vouch gets removed and a big vouch from the very end was moved before them.
+
+Say Mike the lender was `2nd` lender for Alice the borrower, who borrowed more funds from various stakers over time, say `5` in total, and have Bob the big lender placed `5th` on her vouchers array as he entered the last.
+
+Now Jade, Alice's `1st` lender, decided to remove the trust as she got payed back in full and the funds are needed elsewhere. `cancelVouch(Jade, Alice)` was called and Alice vouch array length is reduced to be `4`.
+
+Bob gets placed `1st`, Mike is still `2nd`. Now suppose Mike lent Alice 1 year ago and it was `1k DAI`, while Bob lender yesterday and it was `10k DAI`. Now Alice prepayments will go towards Bob instead of Mike, who has his funds frozen until (and if) Bob's part be payed in full.
+
+## Impact
+
+Net impact is temporal funds freeze if Alice remains to be in good health, and permanent fund freeze if Alice stops paying before Mike's turn of the redemptions. I.e. the prepayment order can determine if Mike loan end up being paid or not. Bob has his situation improved on Mike's behalf, who has worsened perspectives of the overall repayment.
+
+This funds freeze is conditional on cancelVouch() calls, but as it needs to be run with ordinary parameters (i.e. remove **any** old vouch) and it is a typical operation (it will be run from time to time by stakers as their `vouchees` array has limited size), while core UNION logic of lender to borrower correspondence is broken here, so setting the severity to be **high**.
+
+## Code Snippet
+
+cancelVouch() switches the vouch being removed with the last one: 
+
+https://github.com/sherlock-audit/2022-10-union-finance/blob/main/union-v2-contracts/contracts/user/UserManager.sol#L577-L591
+
+```solidity
+    function cancelVouch(address staker, address borrower) public onlyMember(msg.sender) whenNotPaused {
+        if (staker != msg.sender && borrower != msg.sender) revert AuthFailed();
+
+        Index memory voucherIndex = voucherIndexes[borrower][staker];
+        if (!voucherIndex.isSet) revert VoucherNotFound();
+
+        // Check that the locked amount for this vouch is 0
+        Vouch memory vouch = vouchers[borrower][voucherIndex.idx];
+        if (vouch.locked > 0) revert LockedStakeNonZero();
+
+        // Remove borrower from vouchers array by moving the last item into the position
+        // of the index being removed and then poping the last item off the array
+        vouchers[borrower][voucherIndex.idx] = vouchers[borrower][vouchers[borrower].length - 1];
+        vouchers[borrower].pop();
+        delete voucherIndexes[borrower][staker];
+```
+
+This logic is the classic take on array removal, but `vouchers[borrower]` array order is material, being used in updateLocked() assuming that array index is a good proxy for loan age, and adhering to the first in, first out logic:
+
+https://github.com/sherlock-audit/2022-10-union-finance/blob/main/union-v2-contracts/contracts/user/UserManager.sol#L800-L841
+
+```solidity
+    function updateLocked(
+        address borrower,
+        uint96 amount,
+        bool lock
+    ) external onlyMarket {
+        uint96 remaining = amount;
+
+        for (uint256 i = 0; i < vouchers[borrower].length; i++) {
+            Vouch storage vouch = vouchers[borrower][i];
+            uint96 innerAmount;
+
+            if (lock) {
+                // Look up the staker and determine how much unlock stake they
+                // have available for the borrower to borrow. If there is 0
+                // then continue to the next voucher in the array
+                uint96 stakerLocked = stakers[vouch.staker].locked;
+                uint96 stakerStakedAmount = stakers[vouch.staker].stakedAmount;
+                uint96 availableStake = stakerStakedAmount - stakerLocked;
+                uint96 lockAmount = _min(availableStake, vouch.trust - vouch.locked);
+                if (lockAmount == 0) continue;
+
+                // Calculate the amount to add to the lock then
+                // add the extra amount to lock to the stakers locked amount
+                // and also update the vouches locked amount and lastUpdated block
+                innerAmount = _min(remaining, lockAmount);
+                stakers[vouch.staker].locked = stakerLocked + innerAmount;
+                vouch.locked += innerAmount;
+                vouch.lastUpdated = uint64(block.number);
+            } else {
+                // Look up how much this vouch has locked. If it is 0 then
+                // continue to the next voucher. Then calculate the amount to
+                // unlock which is the min of the vouches lock and what is
+                // remaining to unlock
+                uint96 locked = vouch.locked;
+                if (locked == 0) continue;
+                innerAmount = _min(locked, remaining);
+
+                // Update the stored locked values and last updated block
+                stakers[vouch.staker].locked -= innerAmount;
+                vouch.locked -= innerAmount;
+                vouch.lastUpdated = uint64(block.number);
+            }
+```
+
+updateLocked() is called when a borrower repays current debt interest in full:
+
+https://github.com/sherlock-audit/2022-10-union-finance/blob/main/union-v2-contracts/contracts/market/UToken.sol#L573-L619
+
+```solidity
+    function _repayBorrowFresh(
+        address payer,
+        address borrower,
+        uint256 amount
+    ) internal {
+        if (!accrueInterest()) revert AccrueInterestFailed();
+
+        uint256 interest = calculatingInterest(borrower);
+        uint256 borrowedAmount = borrowBalanceStoredInternal(borrower);
+        uint256 repayAmount = amount > borrowedAmount ? borrowedAmount : amount;
+        if (repayAmount == 0) revert AmountZero();
+
+        uint256 toReserveAmount;
+        uint256 toRedeemableAmount;
+
+        if (repayAmount >= interest) {
+        	...
+
+            // Call update locked on the userManager to lock this borrowers stakers. This function
+            // will revert if the account does not have enough vouchers to cover the repay amount. ie
+            // the borrower is trying to repay more than is locked (owed)
+            IUserManager(userManager).updateLocked(borrower, uint96(repayAmount - interest), false);
+```
+
+Which vouch to be updated by updateLocked(), i.e. where to allocate this new repayment if a borrower has many locked vouches, is material as it determines who gets the money back:
+
+https://github.com/sherlock-audit/2022-10-union-finance/blob/main/union-v2-contracts/contracts/user/UserManager.sol#L432-L466
+
+```solidity
+    /**
+     *  @dev Get frozen coin age
+     *  @param  staker Address of staker
+     *  @param  pastBlocks Number of blocks past to calculate coin age from
+     *          coin age = min(block.number - lastUpdated, pastBlocks) * amount
+     */
+    function getFrozenInfo(address staker, uint256 pastBlocks)
+        public
+        view
+        returns (uint256 memberTotalFrozen, uint256 memberFrozenCoinAge)
+    {
+        uint256 overdueBlocks = uToken.overdueBlocks();
+        uint256 voucheesLength = vouchees[staker].length;
+        // Loop through all of the stakers vouchees sum their total
+        // locked balance and sum their total memberFrozenCoinAge
+        for (uint256 i = 0; i < voucheesLength; i++) {
+            // Get the vouchee record and look up the borrowers voucher record
+            // to get the locked amount and lastUpdate block number
+            Vouchee memory vouchee = vouchees[staker][i];
+            Vouch memory vouch = vouchers[vouchee.borrower][vouchee.voucherIndex];
+
+            uint256 lastUpdated = vouch.lastUpdated;
+            uint256 diff = block.number - lastUpdated;
+
+            if (overdueBlocks < diff) {
+                uint96 locked = vouch.locked;
+                memberTotalFrozen += locked;
+                if (pastBlocks >= diff) {
+                    memberFrozenCoinAge += (locked * diff);
+                } else {
+                    memberFrozenCoinAge += (locked * pastBlocks);
+                }
+            }
+        }
+    }
+```
+
+This can mean who gets the money faster or who gets the money at all, depending on the future behavior of the borrower.
+
+## Tool used
+
+Manual Review
+
+## Recommendation
+
+A simplest solution is to do it in a hard way and cycle through the whole array, for example:
+
+https://github.com/sherlock-audit/2022-10-union-finance/blob/main/union-v2-contracts/contracts/user/UserManager.sol#L577-L591
+
+```solidity
+    function cancelVouch(address staker, address borrower) public onlyMember(msg.sender) whenNotPaused {
+        if (staker != msg.sender && borrower != msg.sender) revert AuthFailed();
+
+        Index memory voucherIndex = voucherIndexes[borrower][staker];
+        if (!voucherIndex.isSet) revert VoucherNotFound();
+
+        // Check that the locked amount for this vouch is 0
+        Vouch memory vouch = vouchers[borrower][voucherIndex.idx];
+        if (vouch.locked > 0) revert LockedStakeNonZero();
+
+        // Remove borrower from vouchers array by moving the last item into the position
+        // of the index being removed and then poping the last item off the array
++	... // create new empty array
++       for (uint256 i = 0; i < vouchers[borrower].length; i++) {
++           Vouch storage vouch = vouchers[borrower][i];
++           ... // if `i <> voucherIndex.idx` and vouch has positive trust put it to the new array
++	for (uint256 i = 0; i < vouchers[borrower].length; i++) {
++           Vouch storage vouch = vouchers[borrower][i];
++	    ... // if `i <> voucherIndex.idx` and vouch has zero trust put it to the new array, keeping the old order among them this way
++	... // replace old `vouches` with new array
+-       vouchers[borrower][voucherIndex.idx] = vouchers[borrower][vouchers[borrower].length - 1];
+-       vouchers[borrower].pop();
+
+        delete voucherIndexes[borrower][staker];
+```
+
+It can be feasible as `vouchers` length will not be big in the most cases, cancelVouch() isn't that frequent, and loan order is material for business logic to bear additional gas costs.
+
+Also, this reorganisation of non-zero vouches first, zeros later eliminates the potential issue with stakers leaving vouchers with zero amounts just to keep the place in the redemption queue, which also doesn't adhere to FIFO logic.
+
+## Discussion
+
+**kingjacob**
+
+This is as designed and a function of fifo. 
+
+**dmitriia**
+
+The issue is that `cancelVouch` as it is **breaks** FIFO.
+
+As a result, the lenders can be compensated randomly, not according to FIFO.
+
+**kingjacob**
+
+If cancel vouch changes the locked status of stakers of an outstanding borrow without a borrow or repay happening that would be very bad.
+
+But if im understanding the report as borrower locks 1,2,3. Repays enough to unlock 1. 1 cancels. The order is now 3,2. That doesnt significantly change the risk for 2. The risk is still that the borrower you vouched doesnt repay. Theres maybe a marginal risk, But practically its hard to imagine this scenario occurring separate from a straight default or long repayment cycle. 
+
+That said strict FIFO would be preferred for ease of explanation but looping through changes the cost from 1 to n, with each n costing ~5000 gas per N. So its a tradeoff between this edgecase vs more people being able to afford to cancel bad or stale vouches. 
+
+**dmitriia**
+
+Yes, when the oldest vouch 1 is cancelled, the newest one 3 becomes the oldest, while the previous one, 2, keeps its place.
+
+The implications of this isn't just a slight disturbing of the FIFO order, the resulting order can become fully random. This can be a material consideration for lenders and honest borrowers.
+
+Say Bob lends to Amelie through the system, while she is a big borrower with lots of connections, i.e. she is a vouchee for many vouchers, and use this trust a lot.
+
+Now Bob wants to have his money back and asks Amelie, who isn't insolvent and is able and willing to return the debt to Bob. But she can't as the system with repay the debts in nearly random order originated from the sequence of vouches cancellations and new vouches introductions.
+
+As she can't return all debt to all the borrowers or any substantial part of them at this point, it is simply too much liquidity at once, this queue can't be cleared. Bob can't be repaid due to mere technical issue.
+
+This means that the term of a loan cannot be deemed fixed even if both parties agree on it and do honour this agreement.
+
+But rates do differ drastically depending on the term of a loan. This is the `yield curve` and it is steep most of the times. Current interest rate Union employs can be good for say 3 months loan, but insufficient for 3 years one.
+
+This rate can't be just set higher as it is the matter of credit spread, the difference between this rate and risk-free rate for the *term* of a loan. Risk free rates for different terms are quite different, per risk free yield curve. 
+
+For example, if the rate is set to be high it will mean sufficient spread for longer terms, but overly big for shorter terms and honest borrowers will be reluctant to get loans, and vice versa.
+
+That means keeping FIFO intact is crucial and very well justifies gas costs. Those can be kept lower via, for example, additional array `voucherOrder[borrower]` with historical order of the vouchers and accessing `vouchers` across the code not as `vouchers[borrower][i], i = 0, 1, ...`, but as `vouchers[borrower][voucherOrder[borrower][i]], i = 0, 1, ...`.
+
+The code becomes:
+
+```solidity
+    function cancelVouch(address staker, address borrower) public onlyMember(msg.sender) whenNotPaused {
+        if (staker != msg.sender && borrower != msg.sender) revert AuthFailed();
+
+        Index memory voucherIndex = voucherIndexes[borrower][staker];
+        if (!voucherIndex.isSet) revert VoucherNotFound();
+
+        // Check that the locked amount for this vouch is 0
+        Vouch memory vouch = vouchers[borrower][voucherIndex.idx];
+        if (vouch.locked > 0) revert LockedStakeNonZero();
+
++       bool memory reached;
++       for (uint16 i = 0; i < voucherOrder[borrower].length - 1; i++) {
++           if (!reached) {
++               if (voucherOrder[borrower][i] == voucherIndex.idx) reached = true;
++           }
++           if (reached) voucherOrder[borrower][i] = voucherOrder[borrower][i + 1]
++       }
++       voucherOrder[borrower].pop();    
+
+        // Remove borrower from vouchers array by moving the last item into the position
+        // of the index being removed and then poping the last item off the array
+        vouchers[borrower][voucherIndex.idx] = vouchers[borrower][vouchers[borrower].length - 1];
+        vouchers[borrower].pop();
+```
+
+`voucherOrder.push(vouchers[borrower].length)` needs to be done before pushing to `vouchers[borrower]` in updateTrust().
+
+**Evert0x**
+
+Downgrading to medium severity after discussions with senior, protocol and internally. 
+
+
+
+# Issue M-5: updateTrust() vouchers also need check maxVouchers 
 
 Source: https://github.com/sherlock-audit/2022-10-union-finance-judging/issues/109 
 
@@ -1984,12 +1988,12 @@ Manual Review
 
 ```
 
-# Issue M-5: Unsafe downcasting arithmetic operation in UserManager related contract and in UToken.sol 
+# Issue M-6: Unsafe downcasting arithmetic operation in UserManager related contract and in UToken.sol 
 
 Source: https://github.com/sherlock-audit/2022-10-union-finance-judging/issues/96 
 
 ## Found by 
-ctf\_sec, 8olidity, Lambda
+8olidity, ctf\_sec, Lambda
 
 ## Summary
 
@@ -2131,7 +2135,7 @@ will likely fix with a safecast lib
 
 
 
-# Issue M-6: UserManager.sol#L438-L466 : getFrozenInfo could revert due to out of gas when the vouchees array size is large 
+# Issue M-7: UserManager.sol#L438-L466 : getFrozenInfo could revert due to out of gas when the vouchees array size is large 
 
 Source: https://github.com/sherlock-audit/2022-10-union-finance-judging/issues/87 
 
@@ -2182,7 +2186,7 @@ Anyway it's fully valid for the index introduction part.
 
 
 
-# Issue M-7: getUserInfo() returns incorrect values for locked and stakedAmount 
+# Issue M-8: getUserInfo() returns incorrect values for locked and stakedAmount 
 
 Source: https://github.com/sherlock-audit/2022-10-union-finance-judging/issues/80 
 
@@ -2239,12 +2243,12 @@ Reverse the order of return values in the `getUserInfo()` function, so that it r
 (bool isMember, uint96 stakedAmount, uint96 locked) = userManager.stakers(user);
 ```
 
-# Issue M-8: Priority withdrawal sequence array will grow infinitely over time 
+# Issue M-9: Priority withdrawal sequence array will grow infinitely over time 
 
 Source: https://github.com/sherlock-audit/2022-10-union-finance-judging/issues/76 
 
 ## Found by 
-hyh, GimelSec, hansfriese, yixxas, Lambda
+hyh, hansfriese, yixxas, GimelSec, Lambda
 
 ## Summary
 
@@ -2380,7 +2384,7 @@ https://github.com/sherlock-audit/2022-10-union-finance/blob/main/union-v2-contr
     }
 ```
 
-# Issue M-9: `AssetManager.rebalance()` will revert when the balance of `tokenAddress` in the money market is 0. 
+# Issue M-10: `AssetManager.rebalance()` will revert when the balance of `tokenAddress` in the money market is 0. 
 
 Source: https://github.com/sherlock-audit/2022-10-union-finance-judging/issues/75 
 
@@ -2449,12 +2453,12 @@ I think we can modify [AaveV3Adapter.withdrawAll()](https://github.com/sherlock-
     }
 ```
 
-# Issue M-10: gas limit DoS via unbounded operations 
+# Issue M-11: gas limit DoS via unbounded operations 
 
 Source: https://github.com/sherlock-audit/2022-10-union-finance-judging/issues/69 
 
 ## Found by 
-Ch\_301
+Ch\_301, ctf\_sec
 
 ## Summary
 Only one attack will lead to two types of vulnerabilities in `UserManager.sol` and `UToken.sol`
@@ -2547,12 +2551,12 @@ Some minimal `trustAmount` looks to be needed here as the same can be repeated w
 
 
 
-# Issue M-11: Partial withdrawals by AssetManager lead to user funds freeze 
+# Issue M-12: Partial withdrawals by AssetManager lead to user funds freeze 
 
 Source: https://github.com/sherlock-audit/2022-10-union-finance-judging/issues/50 
 
 ## Found by 
-Jeiwan, hyh
+hyh, Jeiwan
 
 ## Summary
 
@@ -2766,12 +2770,12 @@ https://github.com/sherlock-audit/2022-10-union-finance/blob/main/union-v2-contr
     }
 ```
 
-# Issue M-12: It's impossible to writing off any vouch fully for an outside actor 
+# Issue M-13: It's impossible to writing off any vouch fully for an outside actor 
 
 Source: https://github.com/sherlock-audit/2022-10-union-finance-judging/issues/40 
 
 ## Found by 
-ctf\_sec, Ch\_301, hyh
+hyh, Ch\_301, ctf\_sec
 
 ## Summary
 
@@ -2888,7 +2892,7 @@ https://github.com/sherlock-audit/2022-10-union-finance/blob/main/union-v2-contr
         }
 ```
 
-# Issue M-13: Asset manager's deposit, withdraw and rebalance function calls will get reverted when one of the adapters is broken or paused 
+# Issue M-14: Asset manager's deposit, withdraw and rebalance function calls will get reverted when one of the adapters is broken or paused 
 
 Source: https://github.com/sherlock-audit/2022-10-union-finance-judging/issues/37 
 
@@ -2930,12 +2934,12 @@ try moneyMarket.withdraw(token, account, withdrawAmount) {
 }
 ```
 
-# Issue M-14: Maximal approvals remain for the AssetManager's adapters and tokens after removal 
+# Issue M-15: Maximal approvals remain for the AssetManager's adapters and tokens after removal 
 
 Source: https://github.com/sherlock-audit/2022-10-union-finance-judging/issues/36 
 
 ## Found by 
-bin2chen, Jeiwan, hyh
+hyh, bin2chen, Jeiwan
 
 ## Summary
 
@@ -3130,12 +3134,12 @@ https://github.com/sherlock-audit/2022-10-union-finance/blob/main/union-v2-contr
 
 There new removeTokenApprovals() function similarly to approveAllMarketsMax() cycles across all available markets, setting `IERC20Upgradeable(tokenAddress).safeApprove(address(moneyMarkets[i]), 0)`.
 
-# Issue M-15: `AssetManager::withdraw` will not return false, when fail to send the withdraw amount 
+# Issue M-16: `AssetManager::withdraw` will not return false, when fail to send the withdraw amount 
 
 Source: https://github.com/sherlock-audit/2022-10-union-finance-judging/issues/27 
 
 ## Found by 
-ctf\_sec, yixxas, Ch\_301, cccz, lemonmon
+Ch\_301, ctf\_sec, cccz, yixxas, lemonmon
 
 ## Summary
 
@@ -3184,12 +3188,12 @@ Manual Review
 Check the `remaining` to be transferred and return `false` if it is bigger than zero
 
 
-# Issue M-16: `Comptroller::withdrawRewards` accounting error results in incorrect inflation index 
+# Issue M-17: `Comptroller::withdrawRewards` accounting error results in incorrect inflation index 
 
 Source: https://github.com/sherlock-audit/2022-10-union-finance-judging/issues/26 
 
 ## Found by 
-Lambda, dipp, lemonmon, Jeiwan
+Jeiwan, Lambda, dipp, lemonmon
 
 ## Summary
 
